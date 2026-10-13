@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${K8S_NAMESPACE}
+---
+# 通过 EKS Pod Identity 绑定模型加载角色（只允许读写 S3_BUCKET/models/*）
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ${MODEL_LOADER_SA}
+  namespace: ${K8S_NAMESPACE}
+---
+# 小机型节点 maxPods 很低（g5.2xlarge 只有 14），让推理负载优先于其它排队中的普通 Pod 调度；不抢占已运行的 Pod
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: llm-workload
+value: 100000
+preemptionPolicy: Never
+globalDefault: false
+description: LLM inference / model staging workloads

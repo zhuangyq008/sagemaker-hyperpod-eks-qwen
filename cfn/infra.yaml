@@ -1,0 +1,454 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  HyperPod (EKS orchestrator) base infrastructure for LLM inference -
+  VPC (1 public + 2 private subnets, NAT, S3 gateway endpoint), EKS, IAM roles, S3 bucket.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    AllowedPattern: '^[a-z][a-z0-9-]{1,20}$'
+  VpcCidr:
+    Type: String
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/(1[6-9]|2[0-2])$'
+  HyperPodAzId:
+    Type: String
+  SecondAzId:
+    Type: String
+  EksVersion:
+    Type: String
+  ExtraAzId1: { Type: String, Default: '', Description: 'Optional extra private subnet AZ ID (capacity fallback)' }
+  ExtraAzId2: { Type: String, Default: '' }
+  ExtraAzId3: { Type: String, Default: '' }
+  EksPublicAccessCidrs:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: Empty = private endpoint only
+  S3BucketName:
+    Type: String
+    AllowedPattern: '^sagemaker-[a-z0-9.-]{3,53}$'
+  K8sNamespace:
+    Type: String
+    Default: llm
+  ModelLoaderServiceAccount:
+    Type: String
+    Default: model-loader
+  ModelS3Prefix:
+    Type: String
+    Default: models
+  SystemNodeInstanceType:
+    Type: String
+    Default: ''
+    Description: 'EKS managed CPU node group for controllers (LBC, coredns ...); empty = none'
+  SystemNodeCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 5
+
+Conditions:
+  HasPublicAccess: !Not [!Equals [!Join ['', !Ref EksPublicAccessCidrs], '']]
+  HasExtra1: !Not [!Equals [!Ref ExtraAzId1, '']]
+  HasExtra2: !Not [!Equals [!Ref ExtraAzId2, '']]
+  HasExtra3: !Not [!Equals [!Ref ExtraAzId3, '']]
+  HasSystemNodes: !Not [!Equals [!Ref SystemNodeInstanceType, '']]
+
+Resources:
+  # ---------------------------------------------------------------- VPC
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{ Key: Name, Value: !Sub '${NamePrefix}-vpc' }]
+
+  Igw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub '${NamePrefix}-igw' }]
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref Vpc, InternetGatewayId: !Ref Igw }
+
+  # /20 x 3: [0]=private A (HyperPod AZ), [1]=private B, [2]=public
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZoneId: !Ref HyperPodAzId
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 3, 12]]
+      Tags:
+        - { Key: Name, Value: !Sub '${NamePrefix}-private-a' }
+        - { Key: kubernetes.io/role/internal-elb, Value: '1' }
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZoneId: !Ref SecondAzId
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 3, 12]]
+      Tags:
+        - { Key: Name, Value: !Sub '${NamePrefix}-private-b' }
+        - { Key: kubernetes.io/role/internal-elb, Value: '1' }
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZoneId: !Ref HyperPodAzId
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 3, 12]]
+      Tags:
+        - { Key: Name, Value: !Sub '${NamePrefix}-public' }
+        - { Key: kubernetes.io/role/elb, Value: '1' }
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZoneId: !Ref SecondAzId
+      CidrBlock: !Select [6, !Cidr [!Ref VpcCidr, 7, 12]]
+      Tags:
+        - { Key: Name, Value: !Sub '${NamePrefix}-public-b' }
+        - { Key: kubernetes.io/role/elb, Value: '1' }
+  PublicSubnetBRta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRt }
+
+  PublicRt:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub '${NamePrefix}-public-rt' }]
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties: { RouteTableId: !Ref PublicRt, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref Igw }
+  PublicSubnetRta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnet, RouteTableId: !Ref PublicRt }
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: IgwAttach
+    Properties:
+      Domain: vpc
+      Tags: [{ Key: Name, Value: !Sub '${NamePrefix}-nat-eip' }]
+  Nat:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      AllocationId: !GetAtt NatEip.AllocationId
+      Tags: [{ Key: Name, Value: !Sub '${NamePrefix}-nat' }]
+
+  PrivateRt:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub '${NamePrefix}-private-rt' }]
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties: { RouteTableId: !Ref PrivateRt, DestinationCidrBlock: 0.0.0.0/0, NatGatewayId: !Ref Nat }
+  PrivateSubnetARta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetA, RouteTableId: !Ref PrivateRt }
+  PrivateSubnetBRta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetB, RouteTableId: !Ref PrivateRt }
+
+  # 可选：额外 AZ 的私有子网，只给 HyperPod 节点用（容量不足时在多个 AZ 竞速申请）
+  ExtraPrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Condition: HasExtra1
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZoneId: !Ref ExtraAzId1
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 6, 12]]
+      Tags:
+        - { Key: Name, Value: !Sub '${NamePrefix}-private-extra1' }
+        - { Key: kubernetes.io/role/internal-elb, Value: '1' }
+  ExtraPrivateSubnet1Rta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: HasExtra1
+    Properties: { SubnetId: !Ref ExtraPrivateSubnet1, RouteTableId: !Ref PrivateRt }
+  ExtraPrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Condition: HasExtra2
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZoneId: !Ref ExtraAzId2
+      CidrBlock: !Select [4, !Cidr [!Ref VpcCidr, 6, 12]]
+      Tags:
+        - { Key: Name, Value: !Sub '${NamePrefix}-private-extra2' }
+        - { Key: kubernetes.io/role/internal-elb, Value: '1' }
+  ExtraPrivateSubnet2Rta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: HasExtra2
+    Properties: { SubnetId: !Ref ExtraPrivateSubnet2, RouteTableId: !Ref PrivateRt }
+  ExtraPrivateSubnet3:
+    Type: AWS::EC2::Subnet
+    Condition: HasExtra3
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZoneId: !Ref ExtraAzId3
+      CidrBlock: !Select [5, !Cidr [!Ref VpcCidr, 6, 12]]
+      Tags:
+        - { Key: Name, Value: !Sub '${NamePrefix}-private-extra3' }
+        - { Key: kubernetes.io/role/internal-elb, Value: '1' }
+  ExtraPrivateSubnet3Rta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: HasExtra3
+    Properties: { SubnetId: !Ref ExtraPrivateSubnet3, RouteTableId: !Ref PrivateRt }
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PrivateRt]
+
+  # 安全组：组内全放通（EFA 要求入站 + 出站都显式引用本组）；出站另需访问 EKS API / ECR / HF（经 NAT）
+  ClusterSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${NamePrefix} HyperPod + EKS shared SG'
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - { IpProtocol: '-1', CidrIp: 0.0.0.0/0, Description: 'egress via NAT (EKS API, ECR, HF)' }
+      Tags:
+        - { Key: Name, Value: !Sub '${NamePrefix}-sg' }
+        - { Key: !Sub 'kubernetes.io/cluster/${NamePrefix}-eks', Value: shared }
+  ClusterSgSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ClusterSg
+      IpProtocol: '-1'
+      SourceSecurityGroupId: !Ref ClusterSg
+      Description: intra-SG all traffic (incl. EFA)
+  ClusterSgSelfEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ClusterSg
+      IpProtocol: '-1'
+      DestinationSecurityGroupId: !Ref ClusterSg
+      Description: intra-SG all traffic (required by EFA)
+
+  # ---------------------------------------------------------------- S3
+  Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref S3BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+  BucketTlsOnlyPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: [!GetAtt Bucket.Arn, !Sub '${Bucket.Arn}/*']
+            Condition: { Bool: { 'aws:SecureTransport': 'false' } }
+
+  # ---------------------------------------------------------------- IAM
+  EksClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${NamePrefix}-eks-cluster-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: eks.amazonaws.com }
+            Action: ['sts:AssumeRole', 'sts:TagSession']
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKSClusterPolicy'
+
+  HyperPodExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${NamePrefix}-hyperpod-exec-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: sagemaker.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition: { StringEquals: { 'aws:SourceAccount': !Ref 'AWS::AccountId' } }
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSageMakerClusterInstanceRolePolicy'
+      Policies:
+        - PolicyName: hyperpod-eks-node
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:AssignPrivateIpAddresses
+                  - ec2:AttachNetworkInterface
+                  - ec2:CreateNetworkInterface
+                  - ec2:CreateNetworkInterfacePermission
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DeleteNetworkInterfacePermission
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceTypes
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeTags
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeDhcpOptions
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DetachNetworkInterface
+                  - ec2:ModifyNetworkInterfaceAttribute
+                  - ec2:UnassignPrivateIpAddresses
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetAuthorizationToken
+                  - ecr:GetDownloadUrlForLayer
+                  - eks-auth:AssumeRoleForPodIdentity
+                Resource: '*'
+              - Effect: Allow
+                Action: ec2:CreateTags
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:*:*:network-interface/*'
+
+  # 模型加载角色：Pod Identity → ${K8sNamespace}/${ModelLoaderServiceAccount}，只能读写 models/ 前缀
+  ModelLoaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${NamePrefix}-model-loader-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: pods.eks.amazonaws.com }
+            Action: ['sts:AssumeRole', 'sts:TagSession']
+            Condition: { StringEquals: { 'aws:SourceAccount': !Ref 'AWS::AccountId' } }
+      Policies:
+        - PolicyName: model-bucket-rw
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt Bucket.Arn
+                Condition:
+                  StringLike: { 's3:prefix': [!Sub '${ModelS3Prefix}/*', !Sub '${ModelS3Prefix}'] }
+              - Effect: Allow
+                Action: ['s3:GetObject', 's3:PutObject', 's3:AbortMultipartUpload']
+                Resource: !Sub '${Bucket.Arn}/${ModelS3Prefix}/*'
+
+  # ---------------------------------------------------------------- EKS
+  EksCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Sub '${NamePrefix}-eks'
+      Version: !Ref EksVersion
+      RoleArn: !GetAtt EksClusterRole.Arn
+      AccessConfig:
+        AuthenticationMode: API
+        BootstrapClusterCreatorAdminPermissions: true
+      ResourcesVpcConfig:
+        SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+        SecurityGroupIds: [!Ref ClusterSg]
+        EndpointPrivateAccess: true
+        EndpointPublicAccess: !If [HasPublicAccess, true, false]
+        PublicAccessCidrs: !If [HasPublicAccess, !Ref EksPublicAccessCidrs, !Ref 'AWS::NoValue']
+      Logging:
+        ClusterLogging:
+          EnabledTypes: [{ Type: api }, { Type: audit }, { Type: authenticator }]
+
+  VpcCniAddon:
+    Type: AWS::EKS::Addon
+    Properties: { ClusterName: !Ref EksCluster, AddonName: vpc-cni, ResolveConflicts: OVERWRITE }
+  KubeProxyAddon:
+    Type: AWS::EKS::Addon
+    Properties: { ClusterName: !Ref EksCluster, AddonName: kube-proxy, ResolveConflicts: OVERWRITE }
+  # coredns 在没有节点时会处于 DEGRADED，由 03-eks-bootstrap.sh 用 CLI 创建
+  PodIdentityAddon:
+    Type: AWS::EKS::Addon
+    Properties: { ClusterName: !Ref EksCluster, AddonName: eks-pod-identity-agent, ResolveConflicts: OVERWRITE }
+
+  # HyperPod 节点（ClusterSg）与托管节点组（EKS 集群 SG）互通：Pod 间、DNS、Webhook
+  ClusterSgFromEksSg:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ClusterSg
+      IpProtocol: '-1'
+      SourceSecurityGroupId: !GetAtt EksCluster.ClusterSecurityGroupId
+      Description: from EKS cluster SG (managed node group)
+  EksSgFromClusterSg:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt EksCluster.ClusterSecurityGroupId
+      IpProtocol: '-1'
+      SourceSecurityGroupId: !Ref ClusterSg
+      Description: from HyperPod node SG
+
+  SystemNodeRole:
+    Type: AWS::IAM::Role
+    Condition: HasSystemNodes
+    Properties:
+      RoleName: !Sub '${NamePrefix}-system-node-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKSWorkerNodePolicy'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKS_CNI_Policy'
+  SystemNodegroup:
+    Type: AWS::EKS::Nodegroup
+    Condition: HasSystemNodes
+    DependsOn: [VpcCniAddon, KubeProxyAddon]
+    Properties:
+      ClusterName: !Ref EksCluster
+      NodegroupName: !Sub '${NamePrefix}-system'
+      NodeRole: !GetAtt SystemNodeRole.Arn
+      Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      InstanceTypes: [!Ref SystemNodeInstanceType]
+      AmiType: AL2023_x86_64_STANDARD
+      CapacityType: ON_DEMAND
+      DiskSize: 30
+      ScalingConfig: { MinSize: !Ref SystemNodeCount, MaxSize: !Ref SystemNodeCount, DesiredSize: !Ref SystemNodeCount }
+      Labels: { node-role: system }
+      Tags: { Project: !Ref NamePrefix }
+
+  ModelLoaderPodIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    DependsOn: PodIdentityAddon
+    Properties:
+      ClusterName: !Ref EksCluster
+      Namespace: !Ref K8sNamespace
+      ServiceAccount: !Ref ModelLoaderServiceAccount
+      RoleArn: !GetAtt ModelLoaderRole.Arn
+
+Outputs:
+  VpcId: { Value: !Ref Vpc }
+  PrivateSubnetA: { Value: !Ref PrivateSubnetA }
+  PrivateSubnetB: { Value: !Ref PrivateSubnetB }
+  ExtraPrivateSubnet1: { Condition: HasExtra1, Value: !Ref ExtraPrivateSubnet1 }
+  ExtraPrivateSubnet2: { Condition: HasExtra2, Value: !Ref ExtraPrivateSubnet2 }
+  ExtraPrivateSubnet3: { Condition: HasExtra3, Value: !Ref ExtraPrivateSubnet3 }
+  SecurityGroupId: { Value: !Ref ClusterSg }
+  EksClusterName: { Value: !Ref EksCluster }
+  EksClusterArn: { Value: !GetAtt EksCluster.Arn }
+  HyperPodExecutionRoleArn: { Value: !GetAtt HyperPodExecutionRole.Arn }
+  ModelLoaderRoleArn: { Value: !GetAtt ModelLoaderRole.Arn }
+  BucketName: { Value: !Ref Bucket }
+  PublicSubnetB: { Value: !Ref PublicSubnetB }
+  SystemNodegroupName: { Condition: HasSystemNodes, Value: !Sub '${NamePrefix}-system' }
