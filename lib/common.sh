@@ -44,11 +44,22 @@ COREDNS_REPLICAS="${COREDNS_REPLICAS:-2}"
 SYSTEM_NODE_TYPE="${SYSTEM_NODE_TYPE-t3.large}"        # 空字符串 = 不建系统节点组
 SYSTEM_NODE_COUNT="${SYSTEM_NODE_COUNT:-1}"
 MODEL_NAME="${MODEL_ID##*/}"
+# 模型缓存目录：auto = 机型有 NVMe 实例存储时用 /opt/dlami/nvme（HyperPod 自动挂载，读取更快、不额外计费），
+# 否则用 EBS /opt/sagemaker。实例存储随节点替换丢失不影响：S3 是唯一权威来源，initContainer 会自动重新同步
+MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-auto}"
+if [[ "$MODEL_CACHE_DIR" == "auto" ]]; then
+  if [[ "$(aws ec2 describe-instance-types --instance-types "${INSTANCE_TYPE#ml.}" \
+          --query 'InstanceTypes[0].InstanceStorageSupported' --output text 2>/dev/null)" == "True" ]]; then
+    MODEL_CACHE_DIR=/opt/dlami/nvme/models
+  else
+    MODEL_CACHE_DIR=/opt/sagemaker/models
+  fi
+fi
 MODEL_LOADER_SA="model-loader"
 HELM_RELEASE="hyperpod-dependencies"
 
 export ACCOUNT_ID S3_BUCKET VLLM_IMAGE NLB_SOURCE_RANGES ALB_SCHEME ALB_INBOUND_CIDRS ALB_IDLE_TIMEOUT STACK_NAME EKS_CLUSTER_NAME \
-       HP_CLUSTER_NAME INSTANCE_GROUP_NAME VLLM_CPU_REQUEST VLLM_MEM_REQUEST VLLM_MEM_LIMIT SHM_SIZE MODEL_NAME MODEL_LOADER_SA HELM_RELEASE
+       HP_CLUSTER_NAME INSTANCE_GROUP_NAME MODEL_CACHE_DIR VLLM_CPU_REQUEST VLLM_MEM_REQUEST VLLM_MEM_LIMIT SHM_SIZE MODEL_NAME MODEL_LOADER_SA HELM_RELEASE
 
 [[ "$S3_BUCKET" == sagemaker-* ]] || die "S3_BUCKET 必须以 sagemaker- 开头（托管策略限制），当前: $S3_BUCKET"
 
@@ -65,6 +76,8 @@ safe_check VLLM_EXTRA_ARGS   '^[A-Za-z0-9._/:=,{}" -]+$'
 for _n in TP_SIZE MAX_MODEL_LEN MAX_NUM_SEQS INSTANCE_COUNT EBS_VOLUME_GB; do safe_check "$_n" '^[0-9]+$'; done
 safe_check GPU_MEM_UTIL      '^0?\.[0-9]+$'
 safe_check K8S_NAMESPACE     '^[a-z0-9-]+$'
+safe_check MODEL_CACHE_DIR   '^/opt/(dlami/nvme|sagemaker)(/[A-Za-z0-9._-]+)*$'
+[[ "$MODEL_CACHE_DIR" != *..* ]] || die "MODEL_CACHE_DIR 不允许包含 ..: $MODEL_CACHE_DIR"
 safe_check HYPERPOD_TRAINING_OPERATORS '^(true|false)$'
 safe_check COREDNS_REPLICAS '^[1-9]$'
 safe_check SYSTEM_NODE_TYPE '^[a-z0-9]+\.[a-z0-9]+$'

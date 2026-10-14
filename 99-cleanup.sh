@@ -37,7 +37,20 @@ if aws secretsmanager describe-secret --secret-id "${NAME_PREFIX}/vllm-api-key" 
   aws secretsmanager delete-secret --secret-id "${NAME_PREFIX}/vllm-api-key" --recovery-window-in-days 7 >/dev/null
   ok "Secrets Manager ${NAME_PREFIX}/vllm-api-key 已计划删除（7 天内可恢复）"
 fi
-[[ -n "${DOMAIN_NAME:-}" && -n "${ROUTE53_ZONE_ID:-}" ]] && warn "请手动删除 Route 53 记录 ${DOMAIN_NAME}（zone ${ROUTE53_ZONE_ID}）"
+if [[ -n "${DOMAIN_NAME:-}" && -n "${ROUTE53_ZONE_ID:-}" ]]; then
+  REC=$(aws route53 list-resource-record-sets --hosted-zone-id "$ROUTE53_ZONE_ID" \
+    --query "ResourceRecordSets[?Name=='${DOMAIN_NAME}.' && Type=='A'] | [0]" --output json)
+  if [[ "$REC" != "null" && "$(jq -r '.AliasTarget.DNSName // ""' <<<"$REC")" == *"k8s-${K8S_NAMESPACE}-vllm-"* ]]; then
+    aws route53 change-resource-record-sets --hosted-zone-id "$ROUTE53_ZONE_ID" \
+      --change-batch "$(jq -n --argjson r "$REC" '{Changes: [{Action: "DELETE", ResourceRecordSet: $r}]}')" >/dev/null
+    ok "Route 53 记录 ${DOMAIN_NAME} 已删除"
+  fi
+fi
+
+if aws cloudformation describe-stacks --stack-name "${NAME_PREFIX}-edge" >/dev/null 2>&1; then
+  aws cloudformation delete-stack --stack-name "${NAME_PREFIX}-edge"
+  aws cloudformation wait stack-delete-complete --stack-name "${NAME_PREFIX}-edge" && ok "边缘栈（证书 / WAF）已删除"
+fi
 
 log "2/5 删除 HyperPod 集群 $HP_CLUSTER_NAME"
 if [[ "$(hp_cluster_status)" != "NotFound" ]]; then

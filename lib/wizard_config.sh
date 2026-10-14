@@ -74,8 +74,9 @@ wz_network() {
   ask WZ_EKS_CIDRS "EKS API 公网白名单（auto / 逗号分隔 CIDR / 留空=仅内网）" "auto" '^(auto|)$|^[0-9./,]+$'
 }
 
-pick_from_list() {  # $1=变量名 $2=提示 $3=列表（ARN\t名称）；可选择“不使用”
-  local __name="$1" __prompt="$2" __list="$3" __opts=("不使用") __arns=("") __sel
+pick_from_list() {  # $1=变量名 $2=提示 $3=列表（ARN\t名称） [$4=“自动创建”选项文字]；可选择“不使用”
+  local __name="$1" __prompt="$2" __list="$3" __auto="${4:-}" __opts=("不使用") __arns=("") __sel
+  [[ -n "$__auto" ]] && { __opts+=("$__auto"); __arns+=("auto"); }
   while IFS=$'\t' read -r __arn __label; do [[ -n "$__arn" ]] && { __opts+=("$__label  ${C_D}${__arn}${C_0}"); __arns+=("$__arn"); }; done <<<"$__list"
   __opts+=("手动输入 ARN")
   choose __sel "$__prompt" 1 "${__opts[@]}"
@@ -95,15 +96,21 @@ wz_expose() {
        ask WZ_NLB_CIDRS "允许访问的来源网段（逗号分隔；默认本 VPC，可追加客户 IDC/其它 VPC 网段）" "$WZ_VPC_CIDR" '^[0-9./,]+$'
        pick_from_list WZ_NLB_CERT "TLS 证书（ACM，${WZ_REGION}）：配置后 NLB 使用 443/TLS" "$(list_acm_certs)" ;;
     2) WZ_EXPOSE=alb
-       choose _s "ALB 类型" 1 "internal（内网）" "internet-facing（公网，必须配置证书）"
+       choose _s "ALB 类型" 1 "internal（内网）" "internet-facing（公网，必须 HTTPS）"
        [[ "$_s" == 2 ]] && WZ_ALB_SCHEME=internet-facing
-       pick_from_list WZ_ALB_CERT "HTTPS 证书（ACM，${WZ_REGION}）" "$(list_acm_certs)"
+       ask WZ_DOMAIN "自定义域名（公网建议填写，如 llm.example.com；可留空）" "" '^(([a-z0-9-]+\.)+[a-z]{2,})?$'
+       if [[ -n "$WZ_DOMAIN" ]]; then
+         local zone_guess; zone_guess=$(wz_aws route53 list-hosted-zones --query "HostedZones[?Config.PrivateZone==\`false\`].[Id,Name]" --output text \
+           | while read -r id name; do [[ "$WZ_DOMAIN." == *".$name" ]] && echo "${id##*/}"; done | head -1)
+         ask WZ_ZONE "Route 53 公有 Hosted Zone ID（自动创建域名记录 / 证书验证；留空=手动配置 DNS）" "$zone_guess" '^(Z[A-Z0-9]+)?$'
+       fi
+       local auto_cert=""; [[ -n "$WZ_DOMAIN" && -n "$WZ_ZONE" ]] && auto_cert="自动申请 ${WZ_DOMAIN} 的 ACM 证书（DNS 自动验证）"
+       pick_from_list WZ_ALB_CERT "HTTPS 证书（ACM，${WZ_REGION}）" "$(list_acm_certs)" "$auto_cert"
        [[ "$WZ_ALB_SCHEME" == internet-facing && -z "$WZ_ALB_CERT" ]] && die "internet-facing ALB 必须配置证书"
-       pick_from_list WZ_WAF "WAF Web ACL（REGIONAL）" "$(list_waf_acls)"
+       pick_from_list WZ_WAF "WAF Web ACL（REGIONAL）" "$(list_waf_acls)" "自动创建本项目专用 WAF（托管规则 + 每 IP 限流）"
        local def_cidr="$WZ_VPC_CIDR"; [[ "$WZ_ALB_SCHEME" == internet-facing ]] && def_cidr=""
-       ask WZ_ALB_CIDRS "允许访问的来源网段（逗号分隔；公网填客户出口 IP；0.0.0.0/0 需配合 WAF）" "$def_cidr" '^[0-9./,]+$'
-       ask WZ_DOMAIN "自定义域名（需与证书匹配，可留空）" "" '^(([a-z0-9-]+\.)+[a-z]{2,})?$'
-       [[ -n "$WZ_DOMAIN" ]] && ask WZ_ZONE "Route 53 Hosted Zone ID（留空=手动配置 DNS）" "" '^(Z[A-Z0-9]+)?$' ;;
+       [[ "$WZ_ALB_SCHEME" == internet-facing && -n "$WZ_WAF" ]] && def_cidr="0.0.0.0/0"
+       ask WZ_ALB_CIDRS "允许访问的来源网段（逗号分隔；0.0.0.0/0 需配合 WAF）" "$def_cidr" '^[0-9./,]+$' ;;
     3) WZ_EXPOSE=port-forward; warn "port-forward 只适合调试，业务系统无法使用" ;;
   esac
 }

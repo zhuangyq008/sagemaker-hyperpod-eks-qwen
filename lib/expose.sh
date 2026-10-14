@@ -14,6 +14,33 @@ validate_cidr_list() {  # $1=变量名 $2=允许 0.0.0.0/0（true/false）
   done
 }
 
+# ALB_ACM_CERT_ARN=auto / ALB_WAF_ACL_ARN=auto：部署 cfn/edge.yaml（ACM 证书 DNS 自动验证 + 专用 WAF），回填 ARN
+EDGE_STACK="${NAME_PREFIX}-edge"
+resolve_edge_resources() {
+  [[ "$EXPOSE_MODE" == alb ]] || return 0
+  local cert=false waf=false
+  [[ "${ALB_ACM_CERT_ARN:-}" == auto ]] && cert=true
+  [[ "${ALB_WAF_ACL_ARN:-}" == auto ]] && waf=true
+  $cert || $waf || return 0
+  if $cert; then
+    [[ -n "${DOMAIN_NAME:-}" && -n "${ROUTE53_ZONE_ID:-}" ]] || die "ALB_ACM_CERT_ARN=auto 需要 DOMAIN_NAME 与 ROUTE53_ZONE_ID"
+    aws route53 get-hosted-zone --id "$ROUTE53_ZONE_ID" --query 'HostedZone.Config.PrivateZone' --output text | grep -qx False \
+      || die "ROUTE53_ZONE_ID 必须是公有托管区（ACM DNS 验证）"
+    local zname; zname=$(aws route53 get-hosted-zone --id "$ROUTE53_ZONE_ID" --query 'HostedZone.Name' --output text | sed 's/\.$//')
+    [[ "$DOMAIN_NAME" == "$zname" || "$DOMAIN_NAME" == *".$zname" ]] \
+      || die "DOMAIN_NAME 不属于托管区 $ROUTE53_ZONE_ID"
+  fi
+  log "边缘资源栈 $EDGE_STACK（证书: $cert · WAF: $waf；首次签发证书约 2–5 分钟）"
+  aws cloudformation deploy --stack-name "$EDGE_STACK" --template-file "$ROOT_DIR/cfn/edge.yaml" \
+    --no-fail-on-empty-changeset --tags Project="$NAME_PREFIX" \
+    --parameter-overrides NamePrefix="$NAME_PREFIX" DomainName="${DOMAIN_NAME:-}" HostedZoneId="${ROUTE53_ZONE_ID:-}" \
+      CreateCertificate="$cert" CreateWaf="$waf" RateLimitPer5Min="${WAF_RATE_LIMIT:-300}" >/dev/null
+  edge_out() { aws cloudformation describe-stacks --stack-name "$EDGE_STACK" --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+  $cert && ALB_ACM_CERT_ARN=$(edge_out CertificateArn) && ok "ACM 证书: $ALB_ACM_CERT_ARN"
+  $waf && ALB_WAF_ACL_ARN=$(edge_out WebAclArn) && ok "WAF Web ACL: $ALB_WAF_ACL_ARN"
+  export ALB_ACM_CERT_ARN ALB_WAF_ACL_ARN
+}
+
 validate_expose_config() {
   case "$EXPOSE_MODE" in
     port-forward) ;;
@@ -33,6 +60,7 @@ validate_expose_config() {
       [[ -z "${DOMAIN_NAME:-}" || "$DOMAIN_NAME" =~ ^([a-z0-9-]+\.)+[a-z]{2,}$ ]] || die "DOMAIN_NAME 非法"
       if [[ "$ALB_SCHEME" == internet-facing ]]; then
         [[ -n "${ALB_ACM_CERT_ARN:-}" ]] || die "internet-facing ALB 必须配置 ALB_ACM_CERT_ARN（禁止公网明文 HTTP）"
+        [[ -n "${DOMAIN_NAME:-}" ]] || die "internet-facing ALB 必须配置 DOMAIN_NAME（只接受该 Host，拒绝经 ALB 原始 DNS 访问）"
         local allow_any=false; [[ -n "${ALB_WAF_ACL_ARN:-}" ]] && allow_any=true
         validate_cidr_list ALB_INBOUND_CIDRS "$allow_any"   # 放开 0.0.0.0/0 必须同时挂 WAF
       else
@@ -70,8 +98,14 @@ wait_lb_healthy() {  # $1=LB DNS 名称：等待所有目标组的目标 healthy
 
 route53_upsert() {  # $1=LB DNS 名称：DOMAIN_NAME + ROUTE53_ZONE_ID 都配置时创建 Alias 记录
   [[ -n "${DOMAIN_NAME:-}" && -n "${ROUTE53_ZONE_ID:-}" ]] || return 0
-  local zone
+  local zone cur
   zone=$(aws elbv2 describe-load-balancers --query "LoadBalancers[?DNSName=='$1'].CanonicalHostedZoneId | [0]" --output text)
+  # 只覆盖“不存在”或“已指向本项目 LB（k8s-<ns>-vllm-*）”的记录，避免误改同名业务记录
+  cur=$(aws route53 list-resource-record-sets --hosted-zone-id "$ROUTE53_ZONE_ID" \
+    --query "ResourceRecordSets[?Name=='${DOMAIN_NAME}.' && (Type=='A' || Type=='CNAME')] | [0].[Type,AliasTarget.DNSName]" --output text)
+  if [[ -n "$cur" && "$cur" != "None" && "$cur" != *"k8s-${K8S_NAMESPACE}-vllm-"* ]]; then
+    die "Route 53 中已有 ${DOMAIN_NAME} 记录（$cur）且不属于本项目，拒绝覆盖"
+  fi
   aws route53 change-resource-record-sets --hosted-zone-id "$ROUTE53_ZONE_ID" --change-batch "$(jq -n \
     --arg n "$DOMAIN_NAME" --arg z "$zone" --arg d "$1" \
     '{Changes: [{Action: "UPSERT", ResourceRecordSet: {Name: $n, Type: "A",
@@ -80,6 +114,7 @@ route53_upsert() {  # $1=LB DNS 名称：DOMAIN_NAME + ROUTE53_ZONE_ID 都配置
 }
 
 deploy_expose() {
+  resolve_edge_resources
   validate_expose_config
   local scheme host
   case "$EXPOSE_MODE" in

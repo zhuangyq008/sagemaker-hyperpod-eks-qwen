@@ -24,7 +24,7 @@ spec:
       securityContext: { seccompProfile: { type: RuntimeDefault } }
       volumes:
         - name: models
-          hostPath: { path: /opt/sagemaker/models, type: DirectoryOrCreate }
+          hostPath: { path: ${MODEL_CACHE_DIR}, type: DirectoryOrCreate }
         - name: dshm
           emptyDir: { medium: Memory, sizeLimit: ${SHM_SIZE} }
       initContainers:

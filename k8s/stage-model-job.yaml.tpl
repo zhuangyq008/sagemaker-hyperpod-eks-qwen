@@ -21,7 +21,7 @@ spec:
         node.kubernetes.io/instance-type: ${INSTANCE_TYPE}
       volumes:
         - name: models
-          hostPath: { path: /opt/sagemaker/models, type: DirectoryOrCreate }
+          hostPath: { path: ${MODEL_CACHE_DIR}, type: DirectoryOrCreate }
       initContainers:
         - name: hf-download
           image: public.ecr.aws/docker/library/python:3.12-slim

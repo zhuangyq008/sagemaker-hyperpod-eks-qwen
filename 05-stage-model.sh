@@ -19,7 +19,7 @@ if [[ "$JOB_STATE" == "none" || "$JOB_STATE" == */[1-9]*/* || "$JOB_STATE" != */
   log "提交 Job stage-model: $MODEL_ID → $S3_URI"
   kubectl -n "$K8S_NAMESPACE" delete job stage-model --ignore-not-found >/dev/null
   render "$ROOT_DIR/k8s/stage-model-job.yaml.tpl" \
-    K8S_NAMESPACE MODEL_LOADER_SA INSTANCE_TYPE MODEL_ID MODEL_NAME S3_BUCKET MODEL_S3_PREFIX \
+    K8S_NAMESPACE MODEL_LOADER_SA INSTANCE_TYPE MODEL_CACHE_DIR MODEL_ID MODEL_NAME S3_BUCKET MODEL_S3_PREFIX \
     | kubectl apply -f -
 else
   log "Job stage-model 已在运行（$MODEL_ID），继续跟踪"

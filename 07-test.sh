@@ -46,6 +46,13 @@ for s in smoke chat stream tools; do
   run_client "$s" || { warn "client/$s.py 失败"; FAIL=1; }
 done
 if ! $RUN_IN_POD; then echo "---------- client/curl_examples.sh"; "$ROOT_DIR/client/curl_examples.sh" || FAIL=1; fi
+# 公网 HTTPS 入口：再用“从 Secrets Manager 取 Key”的方式跑一遍（与业务系统的接入方式一致）
+if ! $RUN_IN_POD && [[ "$OPENAI_BASE_URL" == https://* ]] \
+   && aws secretsmanager describe-secret --secret-id "${NAME_PREFIX}/vllm-api-key" >/dev/null 2>&1; then
+  echo "---------- client/public_demo.py（Key 来自 Secrets Manager）"
+  (cd "$ROOT_DIR/client" && env -u OPENAI_API_KEY API_KEY_SECRET_ID="${NAME_PREFIX}/vllm-api-key" \
+     "$VENV/bin/python" public_demo.py) || FAIL=1
+fi
 (( FAIL == 0 )) && ok "功能验证通过" || die "功能验证有失败项"
 
 $SKIP_BENCH && exit 0

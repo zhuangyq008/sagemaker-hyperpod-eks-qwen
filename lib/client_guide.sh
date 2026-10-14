@@ -2,6 +2,9 @@
 # 生成客户端接入指引 CLIENT_GUIDE.md（不含 API Key 明文）；依赖 lib/common.sh
 
 network_section() {
+  local waf="${ALB_WAF_ACL_ARN:-}"
+  [[ "$waf" == auto ]] && waf=$(aws cloudformation describe-stacks --stack-name "${NAME_PREFIX}-edge" \
+    --query "Stacks[0].Outputs[?OutputKey=='WebAclArn'].OutputValue" --output text 2>/dev/null)
   case "$EXPOSE_MODE" in
     internal-nlb) cat <<EOF
 - 访问方式：**内网 NLB**（L4$( [[ -n "${NLB_ACM_CERT_ARN:-}" ]] && echo "，TLS 443" || echo "，HTTP 8000（未配置 TLS，API Key 明文传输）" )）
@@ -12,7 +15,7 @@ EOF
 ;;
     alb) cat <<EOF
 - 访问方式：**ALB（${ALB_SCHEME}）**$( [[ -n "${ALB_ACM_CERT_ARN:-}" ]] && echo "，HTTPS 443（TLS 1.2+）" || echo "，HTTP 80（未配置证书，API Key 明文传输）" )
-- 允许来源：\`${ALB_INBOUND_CIDRS}\`$( [[ -n "${ALB_WAF_ACL_ARN:-}" ]] && echo "；WAF：\`${ALB_WAF_ACL_ARN##*/webacl/}\`" )
+- 允许来源：\`${ALB_INBOUND_CIDRS}\`$( [[ -n "$waf" ]] && echo "；WAF：\`$(cut -d/ -f1 <<<"${waf##*/webacl/}")\`（只放行 /v1/*，每 IP 每 5 分钟 ${WAF_RATE_LIMIT:-300} 次）" )
 - 空闲超时：${ALB_IDLE_TIMEOUT}s（思考模式和长输出需要；客户端超时建议 ≥ 该值）
 $( [[ -n "${DOMAIN_NAME:-}" ]] && echo "- 域名：\`${DOMAIN_NAME}\`$( [[ -n "${ROUTE53_ZONE_ID:-}" ]] && echo "（Route 53 Alias 已自动创建）" || echo "（请在 DNS 中把该域名 CNAME 到 ALB 地址）" )" )
 EOF
@@ -51,6 +54,12 @@ generate_client_guide() {
 
 $(network_section)
 - API Key 请保存在业务系统的密钥管理服务中（如 AWS Secrets Manager），不要写进代码或镜像
+- 业务系统读取 Key 的最小 IAM 权限（只能读这一个密钥）：
+\`\`\`json
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"secretsmanager:GetSecretValue",
+  "Resource":"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:${NAME_PREFIX}/vllm-api-key-*"}]}
+\`\`\`
+- 公网示例：\`client/public_demo.py\`（boto3 从 Secrets Manager 取 Key → HTTPS 调用；同步 + 流式）
 
 ## 3. 推荐参数（来自模型卡）
 
@@ -158,6 +167,9 @@ sync_key_to_secrets_manager() {
   tmp=$(umask 077; mktemp); trap 'rm -f "$tmp"' RETURN
   kubectl -n "$K8S_NAMESPACE" get secret vllm-api-key -o jsonpath='{.data.key}' | base64 -d > "$tmp"
   if aws secretsmanager describe-secret --secret-id "$name" >/dev/null 2>&1; then
+    # 之前清理时“计划删除”的密钥需要先恢复
+    [[ "$(aws secretsmanager describe-secret --secret-id "$name" --query DeletedDate --output text)" != "None" ]] \
+      && aws secretsmanager restore-secret --secret-id "$name" >/dev/null
     aws secretsmanager put-secret-value --secret-id "$name" --secret-string "file://$tmp" >/dev/null
   else
     aws secretsmanager create-secret --name "$name" --description "vLLM API key (${HP_CLUSTER_NAME})" \

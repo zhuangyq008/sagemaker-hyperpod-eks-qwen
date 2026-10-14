@@ -50,8 +50,11 @@ cd hyperpod-eks-llm
 | **`alb`** | 需要 HTTPS / 域名 / WAF；`ALB_SCHEME=internal` 或 `internet-facing` | ACM 证书、TLS 1.2+；`ALB_INBOUND_CIDRS` 来源白名单；`ALB_WAF_ACL_ARN`；空闲超时 900 秒（流式和思考模式需要）；可选 Route 53 Alias |
 | `port-forward` | 仅调试 | 只能在运维终端访问 |
 
+公网示例（已验证）：`ALB_SCHEME=internet-facing`、`DOMAIN_NAME=llm.example.com`、`ROUTE53_ZONE_ID=Z...`、`ALB_ACM_CERT_ARN=auto`、`ALB_WAF_ACL_ARN=auto`、`ALB_INBOUND_CIDRS=0.0.0.0/0`。
+脚本会自动申请证书（DNS 验证）、创建专用 WAF、写入 Route 53 记录，并把 API Key 同步到 Secrets Manager。公网调用示例见 `client/public_demo.py`。
+
 安全约束（脚本会强制检查）：
-- internet-facing ALB **必须配置证书**；
+- internet-facing ALB **必须配置证书和 `DOMAIN_NAME`**；只转发 `/v1`（vLLM 只对 `/v1` 做 API Key 鉴权，`/metrics`、`/tokenize`、`/pause` 等管理接口不鉴权，**绝不能暴露**），其它路径返回 404；自动创建的 WAF 也只放行 `/v1/*`；
 - 来源放开 `0.0.0.0/0` 时**必须挂本区域、本账号且实际存在的 WAF ACL**；
 - CIDR 会做格式和范围校验；
 - 没有配置 TLS 时会提示 API Key 以明文在内网传输。
@@ -83,7 +86,8 @@ S3: sagemaker-hyperpod-<acct>-<region>/{lifecycle,models}/ · Secrets Manager: <
 | `03-eks-bootstrap.sh` | Access Entry、CoreDNS、HyperPod Helm Chart（device plugin 白名单自动补充新机型）、PriorityClass |
 | `04-hyperpod-cluster.sh` | 创建集群（`--create-only`）/ 等待节点并检查 GPU 和驱动（`--wait-nodes`） |
 | `04b-capacity-race.sh` | 在「机型 × AZ」之间竞速申请容量，拿到 1 台后其余缩到 0，并把获胜机型写回 config |
-| `05-stage-model.sh` | HF → 节点 → S3（幂等，可续跑） |
+| `05-stage-model.sh` | HF → 节点 → S3（幂等，可续跑）；节点缓存默认放 NVMe 实例存储（`MODEL_CACHE_DIR=auto`） |
+| `cfn/edge.yaml` | 公网入口：ACM 证书（DNS 自动验证）+ 专用 WAF（`/v1` 白名单、限流、托管规则） |
 | `06-deploy-vllm.sh` + `lib/expose.sh` | vLLM，以及 NLB/ALB 入口（等待目标健康后才算完成） |
 | `07-test.sh` | 经入口做端到端测试；运维终端访问不到内网 LB 时，自动在 VPC 内的 vLLM Pod 中测试 |
 | `client/` | `smoke.py`、`chat.py`、`stream.py`、`tools.py`、`curl_examples.sh` |

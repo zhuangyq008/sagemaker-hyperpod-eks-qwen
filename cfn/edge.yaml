@@ -1,0 +1,106 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Public edge for the vLLM ALB - ACM certificate (DNS validated via Route 53) and a dedicated WAFv2 Web ACL.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    AllowedPattern: '^[a-z][a-z0-9-]{1,20}$'
+  DomainName:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(([a-z0-9-]+\.)+[a-z]{2,})?$'
+  HostedZoneId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(Z[A-Z0-9]+)?$'
+  CreateCertificate:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+  CreateWaf:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+  RateLimitPer5Min:
+    Type: Number
+    Default: 300
+    MinValue: 100
+    MaxValue: 100000
+
+Conditions:
+  DoCert: !Equals [!Ref CreateCertificate, 'true']
+  DoWaf: !Equals [!Ref CreateWaf, 'true']
+
+Resources:
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: DoCert
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId     # CFN 自动创建验证 CNAME 并等待 ISSUED
+      Tags: [{ Key: Project, Value: !Ref NamePrefix }]
+
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Condition: DoWaf
+    Properties:
+      Name: !Sub '${NamePrefix}-llm-api'
+      Scope: REGIONAL
+      DefaultAction: { Allow: {} }
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${NamePrefix}-llm-api'
+      Rules:
+        # 纵深防御：只允许 /v1/*（vLLM 只对 /v1 做 API Key 鉴权）；ALB 监听规则也只转发 /v1
+        - Name: allow-only-v1
+          Priority: 0
+          Action: { Block: {} }
+          Statement:
+            NotStatement:
+              Statement:
+                ByteMatchStatement:
+                  FieldToMatch: { UriPath: {} }
+                  PositionalConstraint: STARTS_WITH
+                  SearchString: /v1/
+                  TextTransformations: [{ Priority: 0, Type: NONE }]
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: allow-only-v1 }
+        - Name: rate-limit-per-ip
+          Priority: 10
+          Action: { Block: {} }
+          Statement:
+            RateBasedStatement: { Limit: !Ref RateLimitPer5Min, AggregateKeyType: IP }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: rate-limit-per-ip }
+        - Name: aws-ip-reputation
+          Priority: 11
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesAmazonIpReputationList }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: aws-ip-reputation }
+        - Name: aws-known-bad-inputs
+          Priority: 12
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesKnownBadInputsRuleSet }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: aws-known-bad-inputs }
+        # 通用规则集：LLM 请求体常超过 8KB、且 prompt 里可能含 HTML/代码，相应 BODY 规则改为只计数
+        - Name: aws-common
+          Priority: 13
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+              RuleActionOverrides:
+                - { Name: SizeRestrictions_BODY, ActionToUse: { Count: {} } }
+                - { Name: CrossSiteScripting_BODY, ActionToUse: { Count: {} } }
+          VisibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: aws-common }
+      Tags: [{ Key: Project, Value: !Ref NamePrefix }]
+
+Outputs:
+  CertificateArn: { Condition: DoCert, Value: !Ref Certificate }
+  WebAclArn: { Condition: DoWaf, Value: !GetAtt WebAcl.Arn }
